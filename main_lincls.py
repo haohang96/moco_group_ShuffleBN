@@ -249,7 +249,7 @@ def main_worker(gpu_rank):
     pretrained_ckpt_path = os.path.join(FLAGS.unsupervised_folder,
         'ckpt_%d.pth.tar'%(FLAGS.pretrained_epoch))
     if FLAGS.moxing:
-        mox.file.mk_dir('/cache/unsupervised/')
+        mox.file.make_dirs('/cache/unsupervised/')
         mox.file.copy(pretrained_ckpt_path, \
             os.path.join('/cache/unsupervised', 'ckpt_%d.pth.tar'%(FLAGS.pretrained_epoch)))
         pretrained_ckpt_path = os.path.join('/cache/unsupervised/', 'ckpt_%d.pth.tar'%(FLAGS.pretrained_epoch))
@@ -320,6 +320,8 @@ def main_worker(gpu_rank):
 
 def train(train_loader, model, net, criterion, optimizer, epoch, gpu_rank, log):
     from utils import Log, AverageMeter, ProgressMeter, accuracy, save_ckpt, adjust_learning_rate
+    if FLAGS.moxing:
+        import moxing as mox
     model.eval()
     net.train()
     losses = AverageMeter('Loss', ':.4e')
@@ -359,10 +361,16 @@ def train(train_loader, model, net, criterion, optimizer, epoch, gpu_rank, log):
             log.logger.info('==> Iter[%3d][%4d/%4d] loss : %2.5f Acc : %s'%
                 (epoch, batch_idx, nbatch_per_epoch, loss_total, [prec[i][0].item() for i in range(len(outputs))]))
 
+    log.logger.info('==> Training stats: Iter[%3d] loss : %2.5f Acc : %s'%
+                (epoch, losses.avg, [acc[i].avg for i in range(len(outputs))]))
+
+
 
 
 def validate(val_loader, model, net, criterion, gpu_rank, log):
     from utils import Log, AverageMeter, ProgressMeter, accuracy, save_ckpt, adjust_learning_rate
+    if FLAGS.moxing:
+        import moxing as mox
     model.eval()
     net.eval()
     losses = AverageMeter('Loss', ':.4e')

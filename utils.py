@@ -125,7 +125,11 @@ def save_ckpt(state, epoch, save_freq, is_best=None):
             if FLAGS.moxing:
                 mox.file.copy(filename, os.path.join(FLAGS.train_url, 'ckpt_%s.pth.tar'%(epoch)))
         if is_best:
-            shutil.copyfile(filename, os.path.join(FLAGS.train_url, 'ckpt_best.pth.tar'))
+            if FLAGS.moxing:
+                mox.file.copy(filename, os.path.join(FLAGS.train_url, 'ckpt_best.pth.tar'))
+            else:
+                shutil.copyfile(filename, os.path.join(FLAGS.train_url, 'ckpt_best.pth.tar'))
+
     else:
         pass
 
