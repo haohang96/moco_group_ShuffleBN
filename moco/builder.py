@@ -2,6 +2,9 @@
 import torch
 import torch.nn as nn
 
+from absl import flags
+from absl import app 
+FLAGS = flags.FLAGS
 
 class MoCo(nn.Module):
     """
@@ -23,8 +26,9 @@ class MoCo(nn.Module):
 
         # create the encoders
         # num_classes is the output fc dimension
-        self.encoder_q = base_encoder(num_classes=dim)
-        self.encoder_k = base_encoder(num_classes=dim)
+        self.encoder_q = base_encoder(FLAGS.effnet_name, num_classes=FLAGS.moco_dim)
+        self.encoder_k = base_encoder(FLAGS.effnet_name, num_classes=FLAGS.moco_dim)
+
 
         if mlp:  # hack: brute-force replacement
             dim_mlp = self.encoder_q.fc.weight.shape[1]

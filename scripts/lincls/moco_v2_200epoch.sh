@@ -1,10 +1,10 @@
 python main_lincls.py \
 --nomoxing \
---train_url=../moco_v2_200epoch_baseline \
---data_dir=/mnt/imagenet2012 \
+--train_url=../moco_v2_200epoch \
+--data_dir=/home/xuhaohang/toy_imagenet \
 --usupv_lr=0.03 \
---usupv_batch=256 \
---pretrained_epoch=199 \
+--usupv_batch=2 \
+--pretrained_epoch=0 \
 --init_lr=30. \
 --batch_size=256 \
 --wd=0. \

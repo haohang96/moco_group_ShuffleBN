@@ -26,10 +26,14 @@ import moco.loader
 import moco.builder
 
 from arch.resnet import *
+from arch.efficientnet_pytorch.model import EfficientNet
 from absl import flags
 from absl import app
 
 FLAGS = flags.FLAGS
+
+# params for effnet arch
+flags.DEFINE_string('effnet_name', 'efficientnet-b0', '')
 
 # default params for ModelArts
 flags.DEFINE_bool('moxing', True, 'modelarts must use moxing mode to run')
@@ -217,7 +221,7 @@ def main_worker(gpu_rank):
     ############################
     # Create Model #
     model = moco.builder.MoCo(
-        resnet50,
+        EfficientNet.from_name,
         FLAGS.moco_dim, FLAGS.moco_k, 
         FLAGS.moco_m, FLAGS.moco_t, 
         FLAGS.mlp)

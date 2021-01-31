@@ -23,11 +23,15 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from classifiers.mul_classifier import MulClassifier as Classifier
+from arch.efficientnet_pytorch.model_cls import EfficientNet
 from arch.resnet_cls import *
 from absl import flags
 from absl import app
 
 FLAGS = flags.FLAGS
+
+# params for effnet arch
+flags.DEFINE_string('effnet_name', 'efficientnet-b0', '')
 
 flags.DEFINE_bool('evaluate', False, '')
 
@@ -222,7 +226,7 @@ def main_worker(gpu_rank):
     # Create Model #  
     from classifiers.cls_opt import net_opt_cls
     log.logger.info('Selected feat info: %s'%(net_opt_cls))
-    model = resnet50()
+    model = EfficientNet.from_name(FLAGS.effnet_name, num_classes=1000)
     net = Classifier(net_opt_cls)
     # log.logger.info(model)
     # log.logger.info(net)

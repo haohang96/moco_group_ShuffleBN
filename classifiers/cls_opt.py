@@ -14,7 +14,7 @@ net_opt_cls[13] = {'pool_type':pool_type, 'nchannels':1024, 'in_feat_size':14, '
 net_opt_cls[14] = {'pool_type':pool_type, 'nchannels':1024, 'in_feat_size':14, 'out_feat_size':7,  'num_class':1000}
 net_opt_cls[15] = {'pool_type':pool_type, 'nchannels':2048, 'in_feat_size':7,  'out_feat_size':7,  'num_class':1000}
 net_opt_cls[16] = {'pool_type':pool_type, 'nchannels':2048, 'in_feat_size':7,  'out_feat_size':7,  'num_class':1000}
-net_opt_cls[17] = {'pool_type':pool_type, 'nchannels':2048, 'in_feat_size':7,  'out_feat_size':1,  'num_class':1000}
+net_opt_cls[17] = {'pool_type':pool_type, 'nchannels':1280, 'in_feat_size':1,  'out_feat_size':1,  'num_class':1000}
 
 len_feat = len(FLAGS.selected_feat_id)
 net_opt_cls = [net_opt_cls[FLAGS.selected_feat_id[i]] for i in range(len_feat)]
