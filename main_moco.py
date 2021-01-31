@@ -25,6 +25,7 @@ import torchvision.models as models
 import moco.loader
 import moco.builder
 
+from moco.folder import ImageFolder
 from arch.resnet import *
 from absl import flags
 from absl import app
@@ -205,7 +206,7 @@ def main_worker(gpu_rank):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize]
-    train_dataset = datasets.ImageFolder(
+    train_dataset = ImageFolder(
         traindir,
         moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
     train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -286,13 +287,14 @@ def main_worker(gpu_rank):
             [losses, top1, top5],
             prefix="Epoch: [{}]".format(epoch))
 
-        for i, (images, _) in enumerate(train_loader):
+        for i, (images_q, mc_q, images_k) in enumerate(train_loader):
 
-            images[0] = images[0].cuda(gpu_rank, non_blocking=True)
-            images[1] = images[1].cuda(gpu_rank, non_blocking=True)
+            images_q = images_q.cuda(gpu_rank, non_blocking=True)
+            mc_q = [q.cuda(gpu_rank, non_blocking=True) for q in mc_q]
+            images_k = images_k.cuda(gpu_rank, non_blocking=True)
 
             # compute output
-            output, target = model(im_q=images[0], im_k=images[1], 
+            output, mc_out, target = model(im_q=images_q, mc_q=mc_q, im_k=images_k, 
                 gpu_rank=gpu_rank, 
                 node_rank=FLAGS.node_rank, 
                 ngpu_per_node=FLAGS.ngpu,
@@ -300,12 +302,19 @@ def main_worker(gpu_rank):
                 groups=groups)
             loss = criterion(output, target)
 
+            mc_loss = torch.tensor(0.).cuda()
+            for out_idx in range(len(mc_out)):
+                _loss = criterion(mc_out[out_idx], target)
+                mc_loss += _loss
+
+            loss = (loss + mc_loss)/2
+
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images[0].size(0))
-            top1.update(acc1[0], images[0].size(0))
-            top5.update(acc5[0], images[0].size(0))
+            losses.update(loss.item(), images_q.size(0))
+            top1.update(acc1[0], images_q.size(0))
+            top5.update(acc5[0], images_q.size(0))
 
             # compute gradient and do SGD step
             optimizer.zero_grad()

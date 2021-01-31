@@ -1,7 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import torch
 import torch.nn as nn
-
+from . import loader as moco_loader
 
 class MoCo(nn.Module):
     """
@@ -114,7 +114,7 @@ class MoCo(nn.Module):
 
         return x_gather[idx_this]
 
-    def forward(self, im_q, im_k, gpu_rank, node_rank, ngpu_per_node, nrank_per_subg, groups):
+    def forward(self, im_q, mc_q, im_k, gpu_rank, node_rank, ngpu_per_node, nrank_per_subg, groups):
         """
         Input:
             im_q: a batch of query images
@@ -129,6 +129,13 @@ class MoCo(nn.Module):
         # compute query features
         q = self.encoder_q(im_q)  # queries: NxC
         q = nn.functional.normalize(q, dim=1)
+
+        all_mc_q = []
+        for i in range(len(mc_q)):
+            _q = self.encoder_q(mc_q[i])
+            _q = nn.functional.normalize(_q, dim=1)
+            all_mc_q.append(_q)
+
 
         # compute key features
         with torch.no_grad():  # no gradient to keys
@@ -156,14 +163,32 @@ class MoCo(nn.Module):
         # apply temperature
         logits /= self.T
 
+
+
+        mc_logits = []
+        for i in range(len(all_mc_q)):
+            _mc_q_i = all_mc_q[i]
+            _logits = self.logits_q_1k(_mc_q_i, k, self.queue)
+            mc_logits.append(_logits)
+
+
+
+
         # labels: positive key indicators
         labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
 
         # dequeue and enqueue
         self._dequeue_and_enqueue(k)
 
-        return logits, labels
+        return logits, mc_logits, labels
 
+
+    def logits_q_1k(self, q, k, queue):
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        l_neg = torch.einsum('nc,ck->nk', [q, queue.clone().detach()])
+        logits = torch.cat([l_pos, l_neg], dim=1)
+        logits /= self.T
+        return logits
 
 # utils
 @torch.no_grad()
