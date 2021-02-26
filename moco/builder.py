@@ -2,6 +2,11 @@
 import torch
 import torch.nn as nn
 
+from absl import flags
+from absl import app 
+
+FLAGS = flags.FLAGS
+
 
 class MoCo(nn.Module):
     """
@@ -30,6 +35,12 @@ class MoCo(nn.Module):
             dim_mlp = self.encoder_q.fc.weight.shape[1]
             self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
             self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
+
+        self.cls_head1 = nn.Linear(dim, FLAGS.cluster_K, bias=False)
+        self.cls_head2 = nn.Linear(dim, FLAGS.cluster_K, bias=False)
+        self.cls_head3 = nn.Linear(dim ,FLAGS.cluster_K, bias=False)
+        self.crossentropy = nn.CrossEntropyLoss(ignore_index=-100).cuda()
+
 
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
@@ -114,7 +125,7 @@ class MoCo(nn.Module):
 
         return x_gather[idx_this]
 
-    def forward(self, im_q, im_k, gpu_rank, node_rank, ngpu_per_node, nrank_per_subg, groups):
+    def forward(self, im_q, im_k, index, pslabels, gpu_rank, node_rank, ngpu_per_node, nrank_per_subg, groups):
         """
         Input:
             im_q: a batch of query images
@@ -156,13 +167,34 @@ class MoCo(nn.Module):
         # apply temperature
         logits /= self.T
 
+        loss_ce_q = self.loss_ce(q, index, pslabels)
+
         # labels: positive key indicators
         labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
 
         # dequeue and enqueue
         self._dequeue_and_enqueue(k)
 
-        return logits, labels
+        return logits, labels, loss_ce_q
+
+
+    def loss_ce(self, q, index, targets):
+        _bs = q.size(0)
+        T = 0.1 # set as deepcluster v2
+        cls_out1 = self.cls_head1(q) / T
+        cls_out2 = self.cls_head2(q) / T
+        cls_out3 = self.cls_head3(q) / T
+
+        target1 = targets[0][index]
+        target2 = targets[1][index]
+        target3 = targets[2][index]
+
+        loss_ce1 = self.crossentropy(cls_out1, target1)
+        loss_ce2 = self.crossentropy(cls_out2, target2)
+        loss_ce3 = self.crossentropy(cls_out3, target3)
+        loss_ce = (loss_ce1 + loss_ce2 + loss_ce3) / 3
+
+        return loss_ce
 
 
 # utils

@@ -25,6 +25,8 @@ import torchvision.models as models
 import moco.loader
 import moco.builder
 
+from moco import folder, cluster_folder
+from clustering import compute_feat, kmeans, knn, kmeans
 from arch.resnet import *
 from absl import flags
 from absl import app
@@ -39,6 +41,7 @@ flags.DEFINE_string('init_method', '', 'accept default flags of modelarts, nothi
 
 # params for dataset path
 flags.DEFINE_string('data_dir', '/cache/dataset', 'path to datasets on S3 or normal filesystem used in dataloader')
+flags.DEFINE_integer('dataset_len', 1281167, '')
 
 # params for workspace folder
 flags.DEFINE_string('cache_ckpt_folder', '', 'folder path to ckpt files in /cache, only need on ModelArts')
@@ -68,6 +71,8 @@ flags.DEFINE_integer('num_workers', 32, '')
 flags.DEFINE_integer('end_epoch', 200, 'total epochs')
 flags.DEFINE_list('schedule', [120, 160], 'epochs when lr need drop')
 flags.DEFINE_float('lr_decay', 0.1, 'scale factor for lr drop')
+flags.DEFINE_float('lam_ce', 1, 'trade-off coefficient of ce loss')
+flags.DEFINE_float('warm_lamce', 10, 'warmup epochs for kmeans classification loss')
 
 # params for hardware
 flags.DEFINE_bool('dist', True, 'DistributedDataparallel or no-dist mode, no-dist mode is only for debug')
@@ -78,6 +83,12 @@ flags.DEFINE_integer('node_rank', 0, 'rank of machine, 0 to nodes_num-1')
 flags.DEFINE_integer('rank', 0, 'rank of total threads, 0 to FLAGS.world_size-1')
 flags.DEFINE_string('master_addr', '127.0.0.1', 'addr for master node')
 flags.DEFINE_string('master_port', '1234', 'port for master node')
+
+# params for cluster
+flags.DEFINE_bool('filter_kmeans', True, 'if use mean dist filter kmeans results')
+flags.DEFINE_integer('cluster_freq',5, '')
+flags.DEFINE_integer('cluster_K',10000, 'cluster num')
+flags.DEFINE_integer('clus_pos_num', 3, 'number of pos select by clustering, no include self')
 
 # params for log and save
 flags.DEFINE_integer('report_freq', 100, '')
@@ -205,15 +216,29 @@ def main_worker(gpu_rank):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize]
-    train_dataset = datasets.ImageFolder(
+    train_dataset = folder.ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        transforms.Compose(augmentation))
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset, num_replicas=FLAGS.world_size, rank=FLAGS.rank)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=FLAGS.batch_size, shuffle=(train_sampler is None),
         num_workers=FLAGS.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True)
     nbatch_per_epoch = len(train_loader)
+    FLAGS.dataset_len = len(train_dataset)
+
+    cluster_augmentation = [transforms.Resize(256),
+           transforms.CenterCrop(224),
+           transforms.ToTensor(),
+           normalize]
+    cluster_dataset = cluster_folder.ImageFolder(traindir, transforms.Compose(cluster_augmentation))
+    cluster_train_sampler = torch.utils.data.distributed.DistributedSampler(
+        cluster_dataset, num_replicas=FLAGS.world_size, shuffle=False, rank=FLAGS.rank)
+    cluster_loader = torch.utils.data.DataLoader(
+        cluster_dataset, batch_size=FLAGS.batch_size, shuffle=False,
+        num_workers=FLAGS.num_workers, pin_memory=True, sampler=cluster_train_sampler, drop_last=False)
+
+
     ############################
     # Create Model #
     model = moco.builder.MoCo(
@@ -275,37 +300,84 @@ def main_worker(gpu_rank):
     # Start Train Process #
     optimizer.zero_grad()
     for epoch in range(start_epoch, FLAGS.end_epoch):
+        if (epoch-start_epoch) % FLAGS.cluster_freq == 0:
+            feats, feats_last = compute_feat(model, cluster_loader, gpu_rank)
+            if FLAGS.rank == 0:
+                # deepcluster v2 need pslabel and centroids vectors
+                # multi-head kmeans (3 head as deepcluster v2)
+                kmeans_res1 = kmeans(feats_last)
+                kmeans_res2 = kmeans(feats_last)
+                kmeans_res3 = kmeans(feats_last)
+                pslabel1 = torch.tensor(kmeans_res1.pseudo_label).cuda()
+                center_vec1 = torch.tensor(kmeans_res1.cluster_center).cuda()
+                pslabel2 = torch.tensor(kmeans_res2.pseudo_label).cuda()
+                center_vec2 = torch.tensor(kmeans_res2.cluster_center).cuda()
+                pslabel3 = torch.tensor(kmeans_res3.pseudo_label).cuda()
+                center_vec3 = torch.tensor(kmeans_res3.cluster_center).cuda()
+            else:
+                pslabel1 = torch.zeros(FLAGS.dataset_len).to(torch.long).cuda() - 1 
+                center_vec1 = torch.zeros(FLAGS.cluster_K, FLAGS.moco_dim).cuda() - 1 
+                pslabel2 = torch.zeros(FLAGS.dataset_len).to(torch.long).cuda() - 1 
+                center_vec2 = torch.zeros(FLAGS.cluster_K, FLAGS.moco_dim).cuda() - 1 
+                pslabel3 = torch.zeros(FLAGS.dataset_len).to(torch.long).cuda() - 1 
+                center_vec3 = torch.zeros(FLAGS.cluster_K, FLAGS.moco_dim).cuda() - 1
+
+
+            torch.distributed.broadcast(pslabel1, 0)
+            torch.distributed.broadcast(center_vec1, 0)
+            torch.distributed.broadcast(pslabel2, 0)
+            torch.distributed.broadcast(center_vec2, 0)
+            torch.distributed.broadcast(pslabel3, 0)
+            torch.distributed.broadcast(center_vec3, 0)
+
+
+            pslabels = [pslabel1, pslabel2, pslabel3]
+            model.module.cls_head1.weight.data.copy_(center_vec1)
+            model.module.cls_head2.weight.data.copy_(center_vec2)
+            model.module.cls_head3.weight.data.copy_(center_vec3)
+            assert (pslabel1 < 0).sum() == 0
+            dist.barrier()
+
+    
+
+
         log.logger.info('Training epoch [%3d/%3d]'%(epoch, FLAGS.end_epoch))
         train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, log)
         losses = AverageMeter('Loss', ':.4e')
+        losses_ce = AverageMeter('Loss_ce', ':.4e')
         top1 = AverageMeter('Acc@1', ':6.2f')
         top5 = AverageMeter('Acc@5', ':6.2f')
         progress = ProgressMeter(
             len(train_loader),
-            [losses, top1, top5],
+            [losses, losses_ce, top1, top5],
             prefix="Epoch: [{}]".format(epoch))
 
-        for i, (images, _) in enumerate(train_loader):
-
-            images[0] = images[0].cuda(gpu_rank, non_blocking=True)
-            images[1] = images[1].cuda(gpu_rank, non_blocking=True)
+        lam_ce = FLAGS.lam_ce if epoch > FLAGS.warm_lamce else 0
+        for i, (images_q, images_k, index) in enumerate(train_loader):
+            _bs = images_q.size(0)
+            images_q = images_q.cuda(gpu_rank, non_blocking=True)
+            images_k = images_k.cuda(gpu_rank, non_blocking=True)
+            index = index.cuda(gpu_rank, non_blocking=True)
 
             # compute output
-            output, target = model(im_q=images[0], im_k=images[1], 
+            output, target, loss_ce = model(im_q=images_q, im_k=images_k, 
+                index=index, pslabels=pslabels,
                 gpu_rank=gpu_rank, 
                 node_rank=FLAGS.node_rank, 
                 ngpu_per_node=FLAGS.ngpu,
                 nrank_per_subg=FLAGS.subgroup,
                 groups=groups)
-            loss = criterion(output, target)
+            loss_moco = criterion(output, target)
+            loss = loss_moco + lam_ce * loss_ce
 
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images[0].size(0))
-            top1.update(acc1[0], images[0].size(0))
-            top5.update(acc5[0], images[0].size(0))
+            losses.update(loss_moco.item(), _bs)
+            losses_ce.update(loss_ce.item(), _bs)
+            top1.update(acc1[0], _bs)
+            top5.update(acc5[0], _bs)
 
             # compute gradient and do SGD step
             optimizer.zero_grad()
