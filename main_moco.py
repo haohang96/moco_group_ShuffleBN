@@ -116,6 +116,8 @@ def main(argv):
         %(FLAGS.init_lr, FLAGS.batch_size))
     if FLAGS.moxing:
         import moxing as mox
+        import subprocess
+        subprocess.call('pip install faiss-gpu==1.6.3', shell=True)
         if not mox.file.exists(FLAGS.train_url):
             mox.file.make_dirs(os.path.join(FLAGS.train_url, 'logs')) # create folder in S3
         mox.file.mk_dir(FLAGS.data_dir) # for example: FLAGS.data_dir='/cache/imagenet2012'
