@@ -83,6 +83,9 @@ flags.DEFINE_string('master_port', '1234', 'port for master node')
 flags.DEFINE_integer('report_freq', 100, '')
 flags.DEFINE_integer('save_freq', 10, '')
 
+# params for multi head
+flags.DEFINE_string('head_type', 'add_stage4_lessconv', '')
+
 # params for group shuffle bn
 flags.DEFINE_integer('subgroup', 4, 'num of ranks each subgroup contain, only subgroup=ngpu is tested (subgroup<ngpu has not beed tested, not recommened)' )
 
@@ -218,6 +221,7 @@ def main_worker(gpu_rank):
     # Create Model #
     model = moco.builder.MoCo(
         resnet50,
+        FLAGS.head_type,
         FLAGS.moco_dim, FLAGS.moco_k, 
         FLAGS.moco_m, FLAGS.moco_t, 
         FLAGS.mlp)
@@ -279,11 +283,13 @@ def main_worker(gpu_rank):
         train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, log)
         losses = AverageMeter('Loss', ':.4e')
+        losses_s4 = AverageMeter('S4_Loss', ':.4e')
+        losses_s3 = AverageMeter('S3_Loss', ':.4e')
         top1 = AverageMeter('Acc@1', ':6.2f')
         top5 = AverageMeter('Acc@5', ':6.2f')
         progress = ProgressMeter(
             len(train_loader),
-            [losses, top1, top5],
+            [losses, losses_s3, losses_s4, top1, top5],
             prefix="Epoch: [{}]".format(epoch))
 
         for i, (images, _) in enumerate(train_loader):
@@ -292,18 +298,23 @@ def main_worker(gpu_rank):
             images[1] = images[1].cuda(gpu_rank, non_blocking=True)
 
             # compute output
-            output, target = model(im_q=images[0], im_k=images[1], 
+            output, output_s3, target = model(im_q=images[0], im_k=images[1],
                 gpu_rank=gpu_rank, 
                 node_rank=FLAGS.node_rank, 
                 ngpu_per_node=FLAGS.ngpu,
                 nrank_per_subg=FLAGS.subgroup,
                 groups=groups)
-            loss = criterion(output, target)
+            loss_s4 = criterion(output, target)
+            loss_s3 = criterion(output_s3, target)
+
+            loss = loss_s4 + loss_s3
 
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images[0].size(0))
+            losses_s4.update(loss_s4.item(), images[0].size(0))
+            losses_s3.update(loss_s3.item(), images[0].size(0))
             top1.update(acc1[0], images[0].size(0))
             top5.update(acc5[0], images[0].size(0))
 
