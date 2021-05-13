@@ -21,6 +21,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torch.nn.functional as F
 
 import moco.loader
 import moco.builder
@@ -39,6 +40,7 @@ flags.DEFINE_string('init_method', '', 'accept default flags of modelarts, nothi
 
 # params for dataset path
 flags.DEFINE_string('data_dir', '/cache/dataset', 'path to datasets on S3 or normal filesystem used in dataloader')
+flags.DEFINE_string('data_tar', 'imagenet.tar', '')
 
 # params for workspace folder
 flags.DEFINE_string('cache_ckpt_folder', '', 'folder path to ckpt files in /cache, only need on ModelArts')
@@ -87,6 +89,33 @@ flags.DEFINE_integer('save_freq', 10, '')
 flags.DEFINE_integer('subgroup', 4, 'num of ranks each subgroup contain, only subgroup=ngpu is tested (subgroup<ngpu has not beed tested, not recommened)' )
 
 
+def pdist(e, squared=False, eps=1e-12):
+    e_square = e.pow(2).sum(dim=1)
+    prod = e @ e.t()
+    res = (e_square.unsqueeze(1) + e_square.unsqueeze(0) - 2 * prod).clamp(min=eps)
+
+    if not squared:
+        res = res.sqrt()
+
+    res = res.clone()
+    res[range(len(e)), range(len(e))] = 0
+    return res
+
+class RkdDistance(nn.Module):
+    def forward(self, s_feat, t_feat):
+        with torch.no_grad():
+            t_d = pdist(t_feat, squared=False)
+            mean_td = t_d[t_d>0].mean()
+            t_d = t_d / mean_td
+
+        d = pdist(s_feat, squared=False)
+        mean_d = d[d>0].mean()
+        d = d / mean_d
+
+        loss = F.smooth_l1_loss(d, t_d, reduction='elementwise_mean')
+        return loss
+
+
 def main(argv):
     del argv
     if FLAGS.seed is not None:
@@ -107,8 +136,15 @@ def main(argv):
         import moxing as mox
         if not mox.file.exists(FLAGS.train_url):
             mox.file.make_dirs(os.path.join(FLAGS.train_url, 'logs')) # create folder in S3
-        mox.file.mk_dir(FLAGS.data_dir) # for example: FLAGS.data_dir='/cache/imagenet2012'
-        mox.file.copy_parallel(FLAGS.data_url, FLAGS.data_dir)
+        # mox.file.mk_dir(FLAGS.data_dir) # for example: FLAGS.data_dir='/cache/imagenet2012'
+        # mox.file.copy_parallel(FLAGS.data_url, FLAGS.data_dir)
+        if FLAGS.data_tar is None:
+            mox.file.mk_dir(FLAGS.data_dir) # for example: FLAGS.data_dir='/cache/imagenet'
+            mox.file.copy_parallel(FLAGS.data_url, FLAGS.data_dir)
+        else:
+            mox.file.copy(os.path.join(FLAGS.data_url, FLAGS.data_tar), '/cache/%s'%(FLAGS.data_tar))
+            os.system('cd /cache && tar -xf /cache/%s'%(FLAGS.data_tar))
+            FLAGS.data_dir = '/cache/%s'%((FLAGS.data_tar).split('.')[0])
     ############################
     if FLAGS.dist:
         if FLAGS.moxing: # if run on modelarts
@@ -217,6 +253,7 @@ def main_worker(gpu_rank):
     ############################
     # Create Model #
     model = moco.builder.MoCo(
+        resnet18,
         resnet50,
         FLAGS.moco_dim, FLAGS.moco_k, 
         FLAGS.moco_m, FLAGS.moco_t, 
@@ -247,6 +284,7 @@ def main_worker(gpu_rank):
     ############################
     # Create Optimizer #
     criterion = nn.CrossEntropyLoss().cuda(gpu_rank)
+    dist_criterion = RkdDistance()
     optimizer = torch.optim.SGD(model.parameters(), FLAGS.init_lr,
                                 momentum=FLAGS.momentum,
                                 weight_decay=FLAGS.wd)
@@ -272,6 +310,19 @@ def main_worker(gpu_rank):
                   .format(ckpt_path, checkpoint['epoch']-1))
     cudnn.benchmark = True
     ############################
+    if FLAGS.moxing:
+        pretrain_path = 's3://bucket-6526/xuhaohang/pretrained_ckpt_and_knn/%s'%(FLAGS.pretrain_path)
+        mox.file.copy(pretrain_path, 'pretrain.pth.tar')
+        pretrained_ckpt = torch.load('pretrain.pth.tar', map_location=torch.device('cpu'))
+        pretrained_state_dict = pretrained_ckpt['state_dict']
+        for k in list(pretrained_state_dict.keys()):
+            if k.startswith('module.encoder_q'):
+                pretrained_state_dict[k.replace('encoder_q', 'encoder_k')] = pretrained_state_dict[k]
+            del pretrained_state_dict[k]
+        msg = model.load_state_dict(pretrained_state_dict, strict=False)
+        print('Mising Keys when load unsupervsied pretrained model: ', msg.missing_keys)
+
+
     # Start Train Process #
     optimizer.zero_grad()
     for epoch in range(start_epoch, FLAGS.end_epoch):
@@ -279,11 +330,13 @@ def main_worker(gpu_rank):
         train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, log)
         losses = AverageMeter('Loss', ':.4e')
+        ins_losses = AverageMeter('InsLoss',':.4e')
+        rkd_losses = AverageMeter('RKDLoss', ':.4e')
         top1 = AverageMeter('Acc@1', ':6.2f')
         top5 = AverageMeter('Acc@5', ':6.2f')
         progress = ProgressMeter(
             len(train_loader),
-            [losses, top1, top5],
+            [losses, rkd_losses, ins_losses, top1, top5],
             prefix="Epoch: [{}]".format(epoch))
 
         for i, (images, _) in enumerate(train_loader):
@@ -292,18 +345,22 @@ def main_worker(gpu_rank):
             images[1] = images[1].cuda(gpu_rank, non_blocking=True)
 
             # compute output
-            output, target = model(im_q=images[0], im_k=images[1], 
+            output, target, s_feat, t_feat = model(im_q=images[0], im_k=images[1],
                 gpu_rank=gpu_rank, 
                 node_rank=FLAGS.node_rank, 
                 ngpu_per_node=FLAGS.ngpu,
                 nrank_per_subg=FLAGS.subgroup,
                 groups=groups)
-            loss = criterion(output, target)
+            ins_loss = criterion(output, target)
+            rkd_loss = dist_criterion(s_feat, t_feat)
 
+            loss = ins_loss + rkd_loss
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images[0].size(0))
+            ins_losses.update(ins_loss.item(), images[0].size(0))
+            rkd_losses.update(rkd_loss.item(), images[0].size(0))
             top1.update(acc1[0], images[0].size(0))
             top5.update(acc5[0], images[0].size(0))
 
