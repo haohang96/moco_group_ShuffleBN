@@ -35,7 +35,7 @@ class MoCo(nn.Module):
             if FLAGS.t_arch != 'resnet50w2':
                 self.encoder_k.fc = nn.Sequential(nn.Linear(2048, 2048), nn.ReLU(), nn.Linear(2048,128))
             else:
-                self.encoder_k.fc = nn.Sequential(nn.Linear(4096, 2048), nn.ReLU(), nn.Linear(2048,128))
+                self.encoder_k.fc = nn.Sequential(nn.Linear(4096, 8192), nn.BatchNorm1d(8192),nn.ReLU(), nn.Linear(8192,128))
 
         for param_k in self.encoder_k.parameters():
             # param_k.data.copy_(param_q.data)  # initialize
