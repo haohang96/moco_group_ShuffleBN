@@ -26,7 +26,8 @@ import torch.nn.functional as F
 import moco.loader
 import moco.builder
 
-from arch.resnet import *
+import arch
+# from arch.resnet import *
 from absl import flags
 from absl import app
 
@@ -88,6 +89,11 @@ flags.DEFINE_integer('save_freq', 10, '')
 # params for group shuffle bn
 flags.DEFINE_integer('subgroup', 4, 'num of ranks each subgroup contain, only subgroup=ngpu is tested (subgroup<ngpu has not beed tested, not recommened)' )
 
+flags.DEFINE_string('s_arch', 'resnet18', 'student model name')
+flags.DEFINE_string('t_arch', 'resnet50', 'student model name')
+flags.DEFINE_float('rkd_lam', 0, 'relational kd lam, 0 means that only kd loss is used')
+flags.DEFINE_string('pretrain_path', '', '')
+flags.DEFINE_string('pretrain_alg',  '', '')
 
 def pdist(e, squared=False, eps=1e-12):
     e_square = e.pow(2).sum(dim=1)
@@ -252,9 +258,11 @@ def main_worker(gpu_rank):
     nbatch_per_epoch = len(train_loader)
     ############################
     # Create Model #
+    student_model = arch.__dict__[FLAGS.s_arch]
+    teacher_model = arch.__dict__[FLAGS.t_arch]
     model = moco.builder.MoCo(
-        resnet18,
-        resnet50,
+        student_model,
+        teacher_model,
         FLAGS.moco_dim, FLAGS.moco_k, 
         FLAGS.moco_m, FLAGS.moco_t, 
         FLAGS.mlp)
@@ -314,13 +322,30 @@ def main_worker(gpu_rank):
         pretrain_path = 's3://bucket-6526/xuhaohang/pretrained_ckpt_and_knn/%s'%(FLAGS.pretrain_path)
         mox.file.copy(pretrain_path, 'pretrain.pth.tar')
         pretrained_ckpt = torch.load('pretrain.pth.tar', map_location=torch.device('cpu'))
-        pretrained_state_dict = pretrained_ckpt['state_dict']
-        for k in list(pretrained_state_dict.keys()):
-            if k.startswith('module.encoder_q'):
-                pretrained_state_dict[k.replace('encoder_q', 'encoder_k')] = pretrained_state_dict[k]
-            del pretrained_state_dict[k]
-        msg = model.load_state_dict(pretrained_state_dict, strict=False)
-        print('Mising Keys when load unsupervsied pretrained model: ', msg.missing_keys)
+
+
+        if FLAGS.pretrain_alg == 'moco':
+            pretrained_state_dict = pretrained_ckpt['state_dict']
+            for k in list(pretrained_state_dict.keys()):
+                if k.startswith('module.encoder_q'):
+                    pretrained_state_dict[k.replace('encoder_q', 'encoder_k')] = pretrained_state_dict[k]
+                del pretrained_state_dict[k]
+            msg = model.load_state_dict(pretrained_state_dict, strict=False)
+            print('Mising Keys when load unsupervsied pretrained model: ', msg.missing_keys)
+
+        if FLAGS.pretrain_alg == 'swav':
+            pretrained_state_dict = pretrained_ckpt
+            for k in list(pretrained_state_dict.keys()):
+                new_k = k[:7] + 'encoder_k.' + k[7:]
+                if 'projection_head' in new_k:
+                    new_k = new_k.replace('projection_head', 'fc')
+                    print(new_k)
+                pretrained_state_dict[new_k] = pretrained_state_dict[k]
+                del pretrained_state_dict[k]
+            msg = model.load_state_dict(pretrained_state_dict, strict=False)
+            print('Mising Keys when load unsupervsied pretrained model: ', msg.missing_keys)
+
+
 
 
     # Start Train Process #
@@ -354,7 +379,7 @@ def main_worker(gpu_rank):
             ins_loss = criterion(output, target)
             rkd_loss = dist_criterion(s_feat, t_feat)
 
-            loss = ins_loss + rkd_loss
+            loss = ins_loss + FLAGS.rkd_lam * rkd_loss
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
