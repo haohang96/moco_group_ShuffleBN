@@ -25,6 +25,7 @@ import torchvision.models as models
 import moco.loader
 import moco.builder
 
+from moco import folder
 from arch.resnet import *
 from absl import flags
 from absl import app
@@ -86,6 +87,8 @@ flags.DEFINE_integer('save_freq', 10, '')
 # params for group shuffle bn
 flags.DEFINE_integer('subgroup', 4, 'num of ranks each subgroup contain, only subgroup=ngpu is tested (subgroup<ngpu has not beed tested, not recommened)' )
 
+# params for mae aug
+flags.DEFINE_float('mae_aug_prob', 0.3, '')
 
 def main(argv):
     del argv
@@ -205,9 +208,9 @@ def main_worker(gpu_rank):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize]
-    train_dataset = datasets.ImageFolder(
+    train_dataset = folder.ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        transforms.Compose(augmentation))
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset, num_replicas=FLAGS.world_size, rank=FLAGS.rank)
     train_loader = torch.utils.data.DataLoader(
@@ -220,7 +223,8 @@ def main_worker(gpu_rank):
         resnet50,
         FLAGS.moco_dim, FLAGS.moco_k, 
         FLAGS.moco_m, FLAGS.moco_t, 
-        FLAGS.mlp)
+        FLAGS.mlp,
+        mae_aug_prob=FLAGS.mae_aug_prob)
     # log.logger.info(model)
     dist.init_process_group(
         backend='nccl',
@@ -230,7 +234,7 @@ def main_worker(gpu_rank):
     torch.cuda.set_device(gpu_rank)
     model.cuda()
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[gpu_rank])
+        model, device_ids=[gpu_rank], find_unused_parameters=True)
     groups = []
     # for example, FLAGS.nodes_num=2, FLAGS.ngpu=4, FLAGS.subgroup=4
     # groups = [[0,1,2,3]] in node_rank = 0
@@ -286,13 +290,14 @@ def main_worker(gpu_rank):
             [losses, top1, top5],
             prefix="Epoch: [{}]".format(epoch))
 
-        for i, (images, _) in enumerate(train_loader):
+        for i, (images_q, images_k, images_mae) in enumerate(train_loader):
 
-            images[0] = images[0].cuda(gpu_rank, non_blocking=True)
-            images[1] = images[1].cuda(gpu_rank, non_blocking=True)
+            images_q = images_q.cuda(gpu_rank, non_blocking=True)
+            images_k = images_k.cuda(gpu_rank, non_blocking=True)
 
             # compute output
-            output, target = model(im_q=images[0], im_k=images[1], 
+            output, target = model(im_q=images_k, im_k=images_q,
+                batch_mae=images_mae,
                 gpu_rank=gpu_rank, 
                 node_rank=FLAGS.node_rank, 
                 ngpu_per_node=FLAGS.ngpu,
@@ -303,9 +308,9 @@ def main_worker(gpu_rank):
             # acc1/acc5 are (K+1)-way contrast classifier accuracy
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images[0].size(0))
-            top1.update(acc1[0], images[0].size(0))
-            top5.update(acc5[0], images[0].size(0))
+            losses.update(loss.item(), images_q.size(0))
+            top1.update(acc1[0], images_q.size(0))
+            top5.update(acc5[0], images_q.size(0))
 
             # compute gradient and do SGD step
             optimizer.zero_grad()
